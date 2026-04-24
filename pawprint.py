@@ -1,11 +1,11 @@
 #!/usr/bin/env -S uv run --quiet
-"""Command-line interface for the MXW01 thermal cat printer.
+"""pawprint - command-line interface for the MXW01 thermal cat printer.
 
 The shebang dispatches via `uv run`, which transparently uses (or creates)
-the project venv defined by `pyproject.toml` / `uv.lock`. So `./cli.py ...`
-works from anywhere inside the repo without needing to activate `.venv`
-first. `--quiet` keeps uv's own "Resolved/Audited" chatter off stderr so
-the CLI's output stays clean.
+the project venv defined by `pyproject.toml` / `uv.lock`. So `./pawprint.py
+...` works from anywhere inside the repo without needing to activate
+`.venv` first. `--quiet` keeps uv's own "Resolved/Audited" chatter off
+stderr so the CLI's output stays clean.
 """
 import argparse
 import asyncio
@@ -50,7 +50,7 @@ def _add_common_args(
     When `suppress_defaults=True`, omits defaults via argparse.SUPPRESS so that
     the same args declared on the top-level parser are not silently
     overwritten by the subparser's defaults when the user only provides them
-    at the top level (e.g. `./cli.py -d X status`).
+    at the top level (e.g. `./pawprint.py -d X status`).
     """
     log_default = argparse.SUPPRESS if suppress_defaults else "warning"
     device_default = argparse.SUPPRESS if suppress_defaults else ""
@@ -223,13 +223,13 @@ def _add_render_args(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Talk to your MXW01 thermal cat printer over BLE.",
-        prog="cli.py",
+        prog="pawprint",
     )
     _add_common_args(parser)
 
     # A parent parser with the same common args, so subcommands also accept
-    # `-d`/`-l` after the subcommand name (e.g. `./cli.py print foo.png -d X`,
-    # which is what the print.py shim relies on for backwards compat).
+    # `-d`/`-l` after the subcommand name (e.g. `./pawprint.py print foo.png
+    # -d X`, which is what the print.py shim relies on for backwards compat).
     # Defaults are SUPPRESSed so that omitting -d/-l on the subcommand does
     # NOT overwrite a value that was passed at the top level.
     common = argparse.ArgumentParser(add_help=False)
@@ -292,8 +292,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def configure_logger(log_level: int) -> None:
     if logger.handlers:
-        # Idempotent: avoid double-handlers when cli.main is re-entered (e.g.
-        # via the print.py shim).
+        # Idempotent: avoid double-handlers when pawprint.main is re-entered
+        # (e.g. via the print.py shim).
         logger.setLevel(log_level)
         for h in logger.handlers:
             h.setLevel(log_level)

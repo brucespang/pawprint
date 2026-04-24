@@ -9,9 +9,9 @@ You just printed your **first** thing!
 
 | Command | What it does |
 |---|---|
-| `cli.py status` | Battery, temp, firmware |
-| `cli.py print img` | Send an image |
-| `cli.py render md` | Markdown → PNG |
+| `pawprint status` | Battery, temp, firmware |
+| `pawprint print img` | Send an image |
+| `pawprint render md` | Markdown → PNG |
 
 ## Try next
 

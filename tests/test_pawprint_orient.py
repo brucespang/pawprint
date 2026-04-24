@@ -1,4 +1,4 @@
-"""Tests for cli._orient_for_print and cli._resolve_reverse.
+"""Tests for pawprint._orient_for_print and pawprint._resolve_reverse.
 
 These cover the orientation transform applied to the binarized image
 before it goes to the encoder, and the markdown-vs-image default for
@@ -8,7 +8,7 @@ the top-left corner" marker) so each transform's effect is unambiguous.
 import numpy as np
 import pytest
 
-from cli import _orient_for_print, _resolve_reverse
+from pawprint import _orient_for_print, _resolve_reverse
 
 
 def _marker_image() -> np.ndarray:

@@ -510,7 +510,7 @@ async def do_print(
     if status.state != cmds.PrinterStates.STANDBY:
         raise cmds.PrinterError(
             f"Printer is not in Standby (state=0x{status.state:02X}); aborting before A9. "
-            "Run `cli.py cancel` or power-cycle the printer and try again."
+            "Run `pawprint cancel` or power-cycle the printer and try again."
         )
 
     print_in_flight = False
@@ -593,7 +593,7 @@ async def do_print(
                 f"(elapsed {elapsed_s:.2f}s, {line_count / elapsed_s:.1f} lines/s)"
             )
             print_in_flight = False
-            # Headline ✓ line is emitted by the caller (cli.cmd_print) so it
+            # Headline ✓ line is emitted by the caller (pawprint.cmd_print) so it
             # can include the filename. Just leave a transient step so the
             # disconnect happens under a tidy "Finishing up" hint.
             reporter.step("Finishing up")

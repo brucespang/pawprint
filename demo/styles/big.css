@@ -1,4 +1,4 @@
-/* Example user stylesheet for `cli.py render --style demo/styles/big.css`.
+/* Example user stylesheet for `pawprint render --style demo/styles/big.css`.
  * Even bigger text + centered top-level headings - everything else inherits
  * from the baked-in default.css. */
 

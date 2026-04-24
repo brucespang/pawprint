@@ -3,7 +3,7 @@
  * The defaults target a 384px-wide thermal printer: high contrast (pure
  * black on white), generous line-height, modest padding, and bullet/check
  * glyphs that survive 1bpp dithering. All rules are overridable: extra
- * stylesheets passed to `cli.py render --style my.css` are appended after
+ * stylesheets passed to `pawprint render --style my.css` are appended after
  * this file, so author-order specificity lets user rules win.
  *
  * Font @font-face url() references use a path relative to this file

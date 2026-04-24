@@ -292,8 +292,8 @@ def test_render_html_reuses_browser(tmp_path: Path):
 
 @_REQUIRES_CHROMIUM
 def test_print_dry_run_autodetects_md(tmp_path: Path):
-    """`cli.py print foo.md --dry-run` should reach the encoder, not BLE."""
-    from cli import main
+    """`pawprint print foo.md --dry-run` should reach the encoder, not BLE."""
+    from pawprint import main
 
     src = tmp_path / "x.md"
     src.write_text("# Hello\n\n- [ ] one\n- [ ] two\n")

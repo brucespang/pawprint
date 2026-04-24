@@ -1,4 +1,4 @@
-This is a tool to print to the MXW01 thermal cat printer, and is a fork of **[jeremy46231/MXW01-catprinter](https://github.com/rbaron/catprinter)**. It is a CLI to print images and markdown files. 
+**pawprint** is a CLI to print images and markdown files to the MXW01 thermal cat printer, and is a fork of **[jeremy46231/MXW01-catprinter](https://github.com/rbaron/catprinter)**.
 
 It has been tested with the following printers:
 
@@ -16,13 +16,14 @@ $ uv sync && uv run playwright install chromium
 
 # Usage
 
-The main entry point is `./cli.py`, which exposes several subcommands. Pass
-`-d <ADDR>` to skip auto-discovery (the address is logged whenever you scan or
-auto-discover) and `-l debug` for verbose output.
+After `uv sync`, the `pawprint` console script is installed in the project
+venv and can be invoked via `uv run pawprint …`. The repo-root
+`./pawprint.py` script is equivalent (it self-bootstraps via `uv run` from
+its shebang).
 
 ```bash
-$ ./cli.py --help
-usage: cli.py [-h] [-l {debug,info,warn,warning,error}] [-d DEVICE] <command> ...
+$ uv run pawprint --help
+usage: pawprint [-h] [-l {debug,info,warn,warning,error}] [-d DEVICE] <command> ...
 
 Talk to your MXW01 thermal cat printer over BLE.
 
@@ -39,35 +40,35 @@ positional arguments:
 
 ```bash
 # Find your printer (no connect, no paper):
-$ ./cli.py scan
+$ uv run pawprint scan
 
 # Quick health check:
-$ ./cli.py status
+$ uv run pawprint status
 
 # Print an image:
-$ ./cli.py print my-image.png --intensity 0x5D
+$ uv run pawprint print my-image.png --intensity 0x5D
 
 # Print an Obsidian-style markdown file (TODO list, note, etc.):
-$ ./cli.py print demo/todo.md
+$ uv run pawprint print demo/todo.md
 
 # Render markdown to a PNG without printing (great for previewing styling):
-$ ./cli.py render demo/todo.md -o /tmp/todo.png
+$ uv run pawprint render demo/todo.md -o /tmp/todo.png
 
 # If you know the address, you can skip the search.
-$ ./cli.py status -d <ADDR>
+$ uv run pawprint status -d <ADDR>
 
 # Cancel an in-progress print
-$ ./cli.py cancel
+$ uv run pawprint cancel
 ```
 
 ### `print` options
 
 ```bash
-$ ./cli.py print --help
-usage: cli.py print [-h] [-l {debug,info,warn,warning,error}] [-d DEVICE]
-                    [-b {mean-threshold,floyd-steinberg,atkinson,halftone,none}]
-                    [-s] [-i INTENSITY] [--top-first] [--reverse | --no-reverse]
-                    filename
+$ uv run pawprint print --help
+usage: pawprint print [-h] [-l {debug,info,warn,warning,error}] [-d DEVICE]
+                      [-b {mean-threshold,floyd-steinberg,atkinson,halftone,none}]
+                      [-s] [-i INTENSITY] [--top-first] [--reverse | --no-reverse]
+                      filename
 ```
 
 - `-b/--dithering-algo`: image binarization algorithm. Use `none` if your
@@ -93,7 +94,7 @@ usage: cli.py print [-h] [-l {debug,info,warn,warning,error}] [-d DEVICE]
 
 ### Rendering markdown
 
-`cli.py render` and `cli.py print` parse Obsidian-flavored markdown
+`pawprint render` and `pawprint print` parse Obsidian-flavored markdown
 and rasterize it to a 384px-wide PNG via headless Chromium. Supported
 features: headings, paragraphs, bold/italic, bullet/numbered/nested lists,
 GFM task lists (`- [ ]` / `- [x]`), GFM tables, fenced code, blockquotes,
@@ -107,7 +108,7 @@ everywhere. Append your own CSS with `--style my.css` (repeatable - later
 files win):
 
 ```bash
-$ ./cli.py render demo/todo.md \
+$ uv run pawprint render demo/todo.md \
     --style demo/styles/big.css \
     --style demo/styles/center.css
 ```
@@ -132,8 +133,8 @@ ordered list, Obsidian wikilink, embedded image, front-matter). Render or
 print it:
 
 ```bash
-$ ./cli.py render demo/todo.md         # writes demo/todo.png
-$ ./cli.py print demo/todo.md
+$ uv run pawprint render demo/todo.md         # writes demo/todo.png
+$ uv run pawprint print demo/todo.md
 ```
 
 # Protocol Documentation
