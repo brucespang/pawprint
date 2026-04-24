@@ -1,4 +1,7 @@
 import logging
+from dataclasses import dataclass
+from typing import Optional
+
 import numpy as np
 
 logger = logging.getLogger(__name__)  # Use local logger
@@ -37,16 +40,65 @@ class CommandIDs:
     PRINT = 0xA9  # Initiate print with dimensions/mode
     PRINT_COMPLETE = 0xAA  # Notification ID when printing finishes
     BATTERY_LEVEL = 0xAB  # Optional status command
-    # CANCEL_PRINT = 0xAC    # Optional control command
+    CANCEL_PRINT = 0xAC  # Cancel an in-progress print
     PRINT_DATA_FLUSH = 0xAD  # Signal end of image data transfer
     # GET_PRINT_TYPE = 0xB0  # Optional status command
     GET_VERSION = 0xB1  # Optional status command
+
+
+# --- Printer States (A1 status payload byte 6) ---
+class PrinterStates:
+    STANDBY = 0x00
+    # PROTOCOL.md says 0x01, but on real MXW01 firmware (1.9.3.1.1) the state
+    # byte transitions from 0x00 -> 0x02 during a print job. We trust the
+    # hardware over the doc here.
+    PRINTING = 0x02
+
+
+# --- Printer Error Codes (A1 status payload byte 13, when flag != 0) ---
+class PrinterErrorCodes:
+    NO_PAPER_1 = 0x01
+    OVERHEATED = 0x04
+    LOW_BATTERY = 0x08
+    NO_PAPER_9 = 0x09
 
 
 # --- Print Modes (for A9 command) ---
 class PrintModes:
     MONOCHROME = 0x00  # 1 bit per pixel
     GRAYSCALE = 0x02  # 4 bits per pixel (Future enhancement)
+
+
+# --- Printer Errors ---
+class PrinterError(RuntimeError):
+    """Raised when the printer reports a runtime error condition."""
+
+    error_code: Optional[int] = None
+
+
+class NoPaperError(PrinterError):
+    error_code = PrinterErrorCodes.NO_PAPER_1
+
+
+class OverheatedError(PrinterError):
+    error_code = PrinterErrorCodes.OVERHEATED
+
+
+class LowBatteryError(PrinterError):
+    error_code = PrinterErrorCodes.LOW_BATTERY
+
+
+def error_for_code(code: int, raw_payload: bytes = b"") -> PrinterError:
+    """Return a typed PrinterError for the given printer error byte."""
+    if code in (PrinterErrorCodes.NO_PAPER_1, PrinterErrorCodes.NO_PAPER_9):
+        return NoPaperError(f"Printer reported: out of paper (code 0x{code:02X})")
+    if code == PrinterErrorCodes.OVERHEATED:
+        return OverheatedError(f"Printer reported: overheated (code 0x{code:02X})")
+    if code == PrinterErrorCodes.LOW_BATTERY:
+        return LowBatteryError(f"Printer reported: low battery (code 0x{code:02X})")
+    err = PrinterError(f"Printer reported error code 0x{code:02X}")
+    err.error_code = code
+    return err
 
 
 # CRC8 (Dallas/Maxim variant, Polynomial 0x07, Init 0x00) Lookup Table
@@ -132,6 +184,140 @@ def cmd_print_request(line_count: int, mode: int = PrintModes.MONOCHROME) -> byt
 def cmd_flush() -> bytearray:
     return create_command(CommandIDs.PRINT_DATA_FLUSH, bytes([0x00]))
 
+
+def cmd_get_battery() -> bytearray:
+    return create_command(CommandIDs.BATTERY_LEVEL, bytes([0x00]))
+
+
+def cmd_get_version() -> bytearray:
+    return create_command(CommandIDs.GET_VERSION, bytes([0x00]))
+
+
+def cmd_cancel() -> bytearray:
+    return create_command(CommandIDs.CANCEL_PRINT, bytes([0x00]))
+
+
+# --- Response parsers ---
+
+
+@dataclass
+class StatusInfo:
+    """Parsed contents of an A1 GET_STATUS notification payload."""
+    is_ok: bool
+    state: Optional[int] = None  # See PrinterStates; only meaningful when is_ok
+    battery_pct: Optional[int] = None
+    temperature: Optional[int] = None
+    error_code: Optional[int] = None  # Only meaningful when not is_ok
+    raw: bytes = b""
+
+    @property
+    def is_standby(self) -> bool:
+        return self.is_ok and self.state == PrinterStates.STANDBY
+
+    def describe(self) -> str:
+        if not self.is_ok:
+            if self.error_code is not None:
+                return f"ERROR (code 0x{self.error_code:02X})"
+            return "ERROR (unknown)"
+        parts = []
+        if self.state is not None:
+            state_name = {
+                PrinterStates.STANDBY: "Standby",
+                PrinterStates.PRINTING: "Printing",
+            }.get(self.state, f"Unknown(0x{self.state:02X})")
+            parts.append(f"state={state_name}")
+        if self.battery_pct is not None:
+            parts.append(f"battery={self.battery_pct}%")
+        if self.temperature is not None:
+            parts.append(f"temp={self.temperature}")
+        return ", ".join(parts) if parts else "OK"
+
+
+@dataclass
+class VersionInfo:
+    """Parsed contents of a B1 GET_VERSION notification payload."""
+    version: str
+    type_byte: Optional[int] = None
+    raw: bytes = b""
+
+
+def parse_status(payload: bytes) -> StatusInfo:
+    """Parse an A1 status response payload.
+
+    Two payload layouts have been seen in the wild and we branch on length:
+
+    "Long" (>=13 bytes) - the format documented in PROTOCOL.md:
+      payload[6]:  state (0=Standby, 1=Printing, ...)
+      payload[9]:  battery level (approx)
+      payload[10]: temperature (approx)
+      payload[12]: overall status flag (0 = OK, non-zero = error)
+      payload[13]: error code (only when flag != 0)
+
+    "Short" (10 bytes) - the format actually emitted by the MXW01 firmware
+    we've observed (e.g. firmware 1.9.3.1.1). Confirmed by comparing the
+    Standby and Printing variants:
+
+      Standby:   00 00 00 64 10 00 00 00 c4 00
+      Printing:  02 00 00 52 15 00 00 00 c4 00
+                 ^state    ^batt%  ^temp(°C)
+
+    The short format has no OK/error flag, so we always treat it as OK and
+    rely on the caller to fall back to AB for battery (the under-load battery
+    here is a noisy voltage reading rather than a fuel gauge).
+    """
+    raw = bytes(payload)
+    if len(raw) >= 13:
+        state = raw[6]
+        battery_pct = raw[9]
+        temperature = raw[10]
+        is_ok = raw[12] == 0
+        error_code = raw[13] if not is_ok and len(raw) >= 14 else None
+        return StatusInfo(
+            is_ok=is_ok,
+            state=state,
+            battery_pct=battery_pct,
+            temperature=temperature,
+            error_code=error_code,
+            raw=raw,
+        )
+
+    if len(raw) >= 5:
+        return StatusInfo(
+            is_ok=True,
+            state=raw[0],
+            battery_pct=raw[3],
+            temperature=raw[4],
+            error_code=None,
+            raw=raw,
+        )
+
+    # Too short to be either format - report as not-ok so callers can complain.
+    return StatusInfo(is_ok=False, raw=raw)
+
+
+def parse_battery(payload: bytes) -> int:
+    """Parse an AB battery level response payload (single byte)."""
+    if len(payload) < 1:
+        raise ValueError("Battery payload is empty")
+    return payload[0]
+
+
+def parse_version(payload: bytes) -> VersionInfo:
+    """Parse a B1 version response payload.
+
+    PROTOCOL.md describes this as `version_utf8(N), unknown, type byte`. The
+    version string runs until the first NUL byte; the trailing byte is
+    interpreted as the type byte when present.
+    """
+    raw = bytes(payload)
+    nul = raw.find(b"\x00")
+    if nul == -1:
+        version = raw.decode("utf-8", errors="replace").strip()
+        type_byte = None
+    else:
+        version = raw[:nul].decode("utf-8", errors="replace").strip()
+        type_byte = raw[-1] if len(raw) > nul + 1 else None
+    return VersionInfo(version=version, type_byte=type_byte, raw=raw)
 
 
 def encode_1bpp_row(image_row_bool: np.ndarray) -> bytearray:

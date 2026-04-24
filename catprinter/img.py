@@ -136,19 +136,16 @@ def read_img(
     bin_img_bool = None
 
     if img_binarization_algo == "atkinson":
-        logger.info("⏳ Applying Atkinson dithering to image...")
+        logger.debug("Applying Atkinson dithering...")
         dithered = atkinson_dither(resized.copy())
-        logger.info("✅ Done.")
         bin_img_bool = dithered > 127
     elif img_binarization_algo == "floyd-steinberg":
-        logger.info("⏳ Applying Floyd-Steinberg dithering to image...")
+        logger.debug("Applying Floyd-Steinberg dithering...")
         dithered = floyd_steinberg_dither(resized.copy())
-        logger.info("✅ Done.")
         bin_img_bool = dithered > 127
     elif img_binarization_algo == "halftone":
-        logger.info("⏳ Applying halftone dithering to image...")
+        logger.debug("Applying halftone dithering...")
         dithered = halftone_dither(resized.copy())
-        logger.info("✅ Done.")
         bin_img_bool = dithered > 127
     elif img_binarization_algo == "mean-threshold":
         bin_img_bool = resized > resized.mean()
@@ -213,7 +210,7 @@ def show_preview(preview_img_uint8: np.ndarray):
             preview_img_uint8 = preview_img_uint8.astype(np.uint8)
 
     cv2.imshow("Preview", preview_img_uint8)
-    logger.info("ℹ️  Displaying preview.")
+    logger.debug("Displaying preview.")
     cv2.waitKey(1)
     if input("🤔 Go ahead with print? [Y/n]? ").lower() == "n":
         cv2.destroyWindow("Preview")

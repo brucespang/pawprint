@@ -1,0 +1,12 @@
+/* Example user stylesheet for `cli.py render --style demo/styles/big.css`.
+ * Even bigger text + centered top-level headings - everything else inherits
+ * from the baked-in default.css. */
+
+body {
+  font-size: 36px;
+  padding: 24px;
+}
+
+h1, h2 {
+  text-align: center;
+}

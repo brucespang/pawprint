@@ -1,0 +1,258 @@
+/* Default stylesheet for catprinter markdown renders.
+ *
+ * The defaults target a 384px-wide thermal printer: high contrast (pure
+ * black on white), generous line-height, modest padding, and bullet/check
+ * glyphs that survive 1bpp dithering. All rules are overridable: extra
+ * stylesheets passed to `cli.py render --style my.css` are appended after
+ * this file, so author-order specificity lets user rules win.
+ *
+ * Font @font-face url() references use a path relative to this file
+ * (../fonts/...). `build_page()` in catprinter/md_render.py rewrites them
+ * to absolute file:// URLs at render time, since Playwright's set_content
+ * has no usable base URL for relative resolution.
+ */
+
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 400;
+  font-display: block;
+  src: url("../fonts/Inter-Regular.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Inter";
+  font-style: italic;
+  font-weight: 400;
+  font-display: block;
+  src: url("../fonts/Inter-Italic.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 700;
+  font-display: block;
+  src: url("../fonts/Inter-Bold.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Inter";
+  font-style: italic;
+  font-weight: 700;
+  font-display: block;
+  src: url("../fonts/Inter-BoldItalic.woff2") format("woff2");
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: block;
+  src: url("../fonts/JetBrainsMono-Regular.woff2") format("woff2");
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 700;
+  font-display: block;
+  src: url("../fonts/JetBrainsMono-Bold.woff2") format("woff2");
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: #fff;
+  color: #000;
+}
+
+body {
+  width: 100%;
+  padding: 16px;
+  font-family: "Inter", system-ui, sans-serif;
+  /* Body sized for thermal-paper readability. Print testing kept landing
+   * on "bigger" - the bullet/checkbox glyphs scale with body, so a chunky
+   * body keeps them from feeling lost next to the headings. */
+  font-size: 28px;
+  line-height: 1.35;
+  /* Disable subpixel AA so dithering has a chance to look clean. */
+  -webkit-font-smoothing: none;
+  font-smooth: never;
+  word-wrap: break-word;
+  overflow-wrap: anywhere;
+  /* Avoid single-word "widow" lines at the bottom of paragraphs. Chromium
+   * 117+ honors this in flow content; older engines just fall back to
+   * normal greedy wrapping (we always render with bundled Chromium). */
+  text-wrap: pretty;
+}
+
+main {
+  display: block;
+}
+
+/* --- Block spacing --- */
+
+h1, h2, h3, h4, h5, h6 {
+  margin: 0.6em 0 0.25em 0;
+  line-height: 1.2;
+  font-weight: 700;
+}
+/* Heading scale tuned to feel like a real page heading on receipt-width
+ * paper, not just "slightly bolder body". Long titles (>~12 chars at h1)
+ * will wrap across multiple lines at 384px - that's intentional. */
+h1 { font-size: 2em; }
+h2 { font-size: 1.75em; }
+h3 { font-size: 1.5em; }
+h4 { font-size: 1.2em; }
+h5 { font-size: 1em; }
+h6 { font-size: 1em; font-weight: 400; font-style: italic; }
+
+p {
+  margin: 0.4em 0;
+}
+
+hr {
+  border: none;
+  border-top: 2px solid #000;
+  margin: 0.8em 0;
+}
+
+blockquote {
+  margin: 0.5em 0;
+  padding: 0.1em 0 0.1em 0.6em;
+  border-left: 3px solid #000;
+  font-style: italic;
+}
+
+/* --- Lists --- */
+
+ul, ol {
+  margin: 0.3em 0;
+  padding-left: 1.4em;
+}
+ul ul, ul ol, ol ul, ol ol {
+  margin: 0.1em 0;
+}
+li {
+  margin: 0.1em 0;
+}
+li > p {
+  margin: 0.1em 0;
+}
+
+/* GFM task lists. The mdit_py_plugins.tasklists plugin emits
+ *   <li class="task-list-item"><input type="checkbox" disabled [checked]> ...</li>
+ * Default Chromium checkboxes use grey fills that dither poorly, so we
+ * replace them with crisp Unicode glyphs via a CSS-only swap.
+ */
+ul:has(> li.task-list-item),
+ol:has(> li.task-list-item) {
+  list-style: none;
+  padding-left: 0.2em;
+}
+li.task-list-item {
+  position: relative;
+  padding-left: 1.4em;
+}
+li.task-list-item > input[type="checkbox"] {
+  display: none;
+}
+li.task-list-item::before {
+  content: "\2610"; /* BALLOT BOX */
+  position: absolute;
+  left: 0;
+  top: 0;
+  font-size: 1.1em;
+  line-height: 1;
+}
+li.task-list-item:has(> input[type="checkbox"]:checked)::before {
+  content: "\2611"; /* BALLOT BOX WITH CHECK */
+}
+
+/* --- Code --- */
+
+code {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 0.9em;
+  background: #000;
+  color: #fff;
+  padding: 0 0.2em;
+  border-radius: 2px;
+  /* On a 384 px page, long inline code spans (full commands, file paths)
+   * will overflow if we try to keep them as a single atomic unit. Allow
+   * normal wrapping so the browser breaks at preferred soft-wrap
+   * opportunities first (spaces, slashes, dots), and only mid-token if
+   * the span still wouldn't fit. */
+  white-space: normal;
+  word-break: normal;
+  overflow-wrap: anywhere;
+}
+
+pre {
+  margin: 0.5em 0;
+  padding: 0.5em;
+  background: #000;
+  color: #fff;
+  overflow-x: hidden;
+  white-space: pre-wrap;
+  /* Lean on `overflow-wrap` from <body> rather than `word-break:
+   * break-all`. That lets Chromium prefer natural break points
+   * (slashes, dots, hyphens) over mid-character splits, which keeps
+   * paths like `demo/todo.md` readable when they wrap. */
+  word-break: normal;
+}
+pre > code {
+  background: transparent;
+  padding: 0;
+  border-radius: 0;
+  /* Inline `code` is `nowrap` to keep tokens atomic; inside a fenced
+   * block we want long lines to wrap normally instead of overflowing. */
+  white-space: pre-wrap;
+}
+
+/* --- Inline marks --- */
+
+strong { font-weight: 700; }
+em { font-style: italic; }
+s, del { text-decoration: line-through; }
+
+a {
+  color: #000;
+  text-decoration: underline;
+}
+a.wikilink {
+  text-decoration: underline;
+  text-decoration-style: dashed;
+  text-underline-offset: 2px;
+}
+
+/* --- Tables ---
+ * 384px is narrow; tables compress aggressively but borders stay readable.
+ */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.5em 0;
+  font-size: 0.9em;
+}
+th, td {
+  border: 1px solid #000;
+  padding: 0.2em 0.4em;
+  text-align: left;
+  vertical-align: top;
+}
+th {
+  font-weight: 700;
+  background: #000;
+  color: #fff;
+}
+
+/* --- Images ---
+ * Cap to body width so wide source images don't overflow.
+ */
+img {
+  max-width: 100%;
+  height: auto;
+  display: block;
+  margin: 0.4em 0;
+}

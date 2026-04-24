@@ -1,8 +1,9 @@
 import asyncio
 import contextlib
 import uuid
-from typing import Optional, Dict, Any
-import logging
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
 from bleak import BleakClient, BleakScanner
 from bleak.backends.scanner import AdvertisementData
@@ -11,21 +12,96 @@ from bleak.exc import BleakError
 
 from . import cmds
 from . import logger
+from .ui import NULL_REPORTER, Reporter, countdown_step
 
 PACING_DELAY_S = 0.015
 NOTIFICATION_TIMEOUT_S = 7.0
+# 35 lines/s was measured on an MXW01 (1380 lines in 38.9s). It controls two things:
+# 1. How long to wait for the printer's AA "print complete" notification after
+#    we send the AD flush. Computed as:
+#      timeout = PRINT_COMPLETE_BASE_TIMEOUT_S + line_count / PRINT_COMPLETE_LINES_PER_SEC
+#    i.e. a fixed slack budget plus the time the print itself should take. The
+# 2. The user-facing "Estimated ~Xs" hint shown right before data send.
 PRINT_COMPLETE_BASE_TIMEOUT_S = 15.0
-PRINT_COMPLETE_LINES_PER_SEC = 15.0
+PRINT_COMPLETE_LINES_PER_SEC = 35.0
+POST_CANCEL_DELAY_S = 0.25
 
-SCAN_TIMEOUT_S = 10
+# Discovery: short first attempt so an impatient user can power the printer on
+# without waiting too long, then a longer second attempt.
+SCAN_FIRST_ATTEMPT_S = 4
+SCAN_RETRY_ATTEMPT_S = 6
+SCAN_ATTEMPTS = 2
+# Kept for compatibility with code that imports SCAN_TIMEOUT_S.
+SCAN_TIMEOUT_S = SCAN_FIRST_ATTEMPT_S + SCAN_RETRY_ATTEMPT_S
 
 NotificationState = Dict[str, Any]
 
 
-async def scan(name: Optional[str], timeout: int):
+@dataclass
+class PrinterSession:
+    """A connected, notification-enabled BLE session with the printer."""
+
+    client: BleakClient
+    control_char: Any
+    notify_char: Any
+    data_char: Any
+    notify_char_uuid: str
+    notification_state: NotificationState = field(default_factory=dict)
+    reporter: Reporter = field(default=NULL_REPORTER)
+
+
+# --- Discovery ---
+
+
+async def do_scan(
+    timeout: float = SCAN_TIMEOUT_S,
+    name: Optional[str] = None,
+    on_found: Optional[Any] = None,
+) -> List[BLEDevice]:
+    """Scan for nearby MXW01 printers (devices advertising the main service).
+
+    If `name` is given, only devices with that advertisement name are returned;
+    otherwise all devices advertising the MXW01 service UUID are returned.
+
+    If `on_found` is provided, it is invoked the FIRST time each matching
+    device is seen (BLE advertisements repeat every few hundred ms, so this
+    callback is de-duplicated by address). Use it to render results live as
+    the scan progresses instead of waiting for the full timeout.
+    """
+    possible_service_uuids = {
+        cmds.MAIN_SERVICE_UUID.lower(),
+        cmds.MAIN_SERVICE_UUID_ALT.lower(),
+    }
+    matches: Dict[str, BLEDevice] = {}
+
+    def detection(device: BLEDevice, ad: AdvertisementData) -> None:
+        ad_uuids = {s.lower() for s in (ad.service_uuids or [])}
+        service_match = bool(ad_uuids & possible_service_uuids)
+        name_match = name is None or device.name == name
+        if name is not None and not name_match:
+            return
+        if not service_match and name is None:
+            return
+        if device.address in matches:
+            return
+        matches[device.address] = device
+        if on_found is not None:
+            try:
+                on_found(device)
+            except Exception as e:
+                logger.debug(f"on_found callback raised: {e}")
+
+    async with BleakScanner(detection_callback=detection):
+        await asyncio.sleep(timeout)
+
+    return list(matches.values())
+
+
+async def scan(name: Optional[str], timeout: int) -> BLEDevice:
+    """Scan for a single matching printer; raise if none found."""
     autodiscover = not name
     if autodiscover:
-        logger.info("⏳ Trying to auto-discover a printer (MXW01 Service)...")
+        logger.debug("Auto-discovering printer (MXW01 service)...")
         possible_service_uuids = [
             cmds.MAIN_SERVICE_UUID.lower(),
             cmds.MAIN_SERVICE_UUID_ALT.lower(),
@@ -35,7 +111,7 @@ async def scan(name: Optional[str], timeout: int):
             for uuid in possible_service_uuids
         )
     else:
-        logger.info(f"⏳ Looking for a BLE device named {name}...")
+        logger.debug(f"Looking for a BLE device named {name!r}...")
         filter_fn = lambda d, ad: d.name == name
 
     device = await BleakScanner.find_device_by_filter(
@@ -44,10 +120,40 @@ async def scan(name: Optional[str], timeout: int):
     )
     if device is None:
         raise RuntimeError(
-            "Unable to find printer, make sure it is turned on and in range"
+            "Unable to find printer; make sure it is turned on and in range"
         )
-    logger.info(f"✅ Got it. Address: {device}")
+    logger.debug(f"Found device: name={device.name!r}, address={device.address}")
     return device
+
+
+async def scan_with_retry(
+    name: Optional[str],
+    reporter: "Reporter",
+    attempts: int = SCAN_ATTEMPTS,
+    first_timeout: float = SCAN_FIRST_ATTEMPT_S,
+    retry_timeout: float = SCAN_RETRY_ATTEMPT_S,
+) -> BLEDevice:
+    """Scan with one retry. Updates the reporter step on each attempt."""
+    label = f"named {name!r}" if name else "printer"
+    last_err: Optional[RuntimeError] = None
+    for i in range(1, attempts + 1):
+        timeout = first_timeout if i == 1 else retry_timeout
+
+        def fmt(remaining: float, _i: int = i) -> str:
+            if _i == 1:
+                return f"Discovering {label} ({remaining:.0f}s left)"
+            return (
+                f"Still no {label}; turn it on if needed... "
+                f"(try {_i}/{attempts}, {remaining:.0f}s left)"
+            )
+
+        async with countdown_step(reporter, fmt, timeout):
+            try:
+                return await scan(name, timeout=int(timeout))
+            except RuntimeError as e:
+                last_err = e
+    assert last_err is not None
+    raise last_err
 
 
 async def get_device_address(device: Optional[str]):
@@ -56,8 +162,17 @@ async def get_device_address(device: Optional[str]):
             return str(uuid.UUID(device))
         if device.count(":") == 5 and device.replace(":", "").isalnum():
             return device
+        logger.debug(
+            f"Treating -d {device!r} as an advertised name (not a UUID/MAC); "
+            "scanning for it."
+        )
 
+    # Note: this code path no longer drives the user-facing reporter. New
+    # callers should use scan_with_retry directly. Kept for any external use.
     return await scan(device, timeout=SCAN_TIMEOUT_S)
+
+
+# --- Notification plumbing ---
 
 
 def notification_receiver_factory(notification_state: NotificationState):
@@ -86,23 +201,25 @@ def notification_receiver_factory(notification_state: NotificationState):
                         footer = data[expected_payload_end_idx + 1]
                         crc_calculated = cmds.calculate_crc8(payload)
                         if crc_received != crc_calculated:
-                            logger.warning(
+                            logger.debug(
                                 f"CRC mismatch for 0x{cmd_id:02X}. Got {crc_received:02X}, expected {crc_calculated:02X}. Payload: {payload.hex()}"
                             )
                         if footer != 0xFF:
-                            logger.warning(
+                            logger.debug(
                                 f"Invalid footer for 0x{cmd_id:02X}. Got {footer:02X}, expected FF."
                             )
                     elif len(data) > expected_payload_end_idx:
-                        # Data is longer than payload but shorter than full packet
-                        logger.warning(
-                            f"Notification for 0x{cmd_id:02X} possibly truncated. Length {len(data)}, expected payload end at {expected_payload_end_idx}, expected total {expected_total_len}. Skipping CRC/Footer check."
+                        # Some firmwares (e.g. version 1.9.3.1.1) consistently
+                        # omit the trailing CRC + footer. That's expected, log
+                        # at debug only.
+                        logger.debug(
+                            f"Notification 0x{cmd_id:02X} missing CRC/footer (got {len(data)} bytes, expected {expected_total_len}). Skipping integrity check."
                         )
                     # else: Data ends exactly after payload, CRC/Footer definitely missing.
 
                     # --- Process the payload regardless of CRC/Footer issues ---
-                    logger.info(
-                        f"Received Response ID: 0x{cmd_id:02X}, Payload: {payload.hex()}"
+                    logger.debug(
+                        f"Received notification 0x{cmd_id:02X}: {payload.hex()}"
                     )
                     asyncio.create_task(update_notification_state(cmd_id, payload))
 
@@ -126,233 +243,421 @@ def notification_receiver_factory(notification_state: NotificationState):
     return notification_receiver
 
 
-async def wait_for_notification(
-    notification_state: NotificationState, expected_cmd_id: int, timeout: float
+def _new_notification_state() -> NotificationState:
+    return {
+        "received": {},
+        "condition": asyncio.Condition(),
+    }
+
+
+async def arm(session: PrinterSession, expected_cmd_id: int) -> None:
+    """Clear any stale notification for `expected_cmd_id`.
+
+    Must be called BEFORE writing the request command, so a fast response is
+    not silently discarded by a later pop.
+    """
+    cond = session.notification_state["condition"]
+    async with cond:
+        session.notification_state["received"].pop(expected_cmd_id, None)
+
+
+async def wait_for(
+    session: PrinterSession, expected_cmd_id: int, timeout: float
 ) -> Optional[bytes]:
-    async with notification_state["condition"]:
-        notification_state["received"].pop(expected_cmd_id, None)
+    """Wait for a notification of `expected_cmd_id`. Caller must have armed first."""
+    cond = session.notification_state["condition"]
+    received = session.notification_state["received"]
+    async with cond:
         try:
             await asyncio.wait_for(
-                notification_state["condition"].wait_for(
-                    lambda: expected_cmd_id in notification_state["received"]
-                ),
+                cond.wait_for(lambda: expected_cmd_id in received),
                 timeout=timeout,
             )
-            payload = notification_state["received"].pop(expected_cmd_id)
-            logger.debug(f"Successfully received notification 0x{expected_cmd_id:02X}")
+            payload = received.pop(expected_cmd_id)
+            logger.debug(f"Waited and received notification 0x{expected_cmd_id:02X}")
             return payload
         except asyncio.TimeoutError:
-            logger.error(
+            logger.debug(
                 f"Timeout waiting for notification 0x{expected_cmd_id:02X} after {timeout}s"
             )
             return None
 
 
-async def run_ble(image_data_buffer: bytes, device: Optional[str], intensity: int):
-    address = None
-    client = None
-    notify_char_uuid = None
+async def send_and_wait(
+    session: PrinterSession,
+    cmd_bytes: bytes,
+    expected_cmd_id: int,
+    timeout: float,
+) -> Optional[bytes]:
+    """Arm + write + wait, race-free."""
+    await arm(session, expected_cmd_id)
+    await session.client.write_gatt_char(
+        session.control_char.uuid, cmd_bytes, response=False
+    )
+    return await wait_for(session, expected_cmd_id, timeout)
 
+
+# --- Connection lifecycle ---
+
+
+@asynccontextmanager
+async def connected_printer(
+    device: Optional[str],
+    reporter: Reporter = NULL_REPORTER,
+):
+    """Resolve the device, connect, find the MXW01 service+characteristics,
+    enable notifications, and yield a `PrinterSession`. Cleans up on exit.
+
+    Drives the user-visible `Discovering`/`Connecting` step lines through the
+    given reporter, and finishes with a permanent `✓ <name> (<address>)`
+    line so subsequent step calls (from do_print etc.) overwrite cleanly.
+    """
+    autodiscovered = not device
     try:
-        address = await get_device_address(device)
+        # Auto-discovery returns a BLEDevice (with a name); a literal address
+        # just round-trips through get_device_address. We need the name when
+        # available so the final line reads nicely.
+        if autodiscovered:
+            ble_device = await scan_with_retry(None, reporter)
+            address = ble_device.address
+            display_name = ble_device.name or "MXW01"
+        else:
+            reporter.step(f"Resolving {device}")
+            address = await get_device_address(device)
+            # If the user passed an address (UUID/MAC), `device` matches
+            # `address` modulo case (UUIDs get normalised). In that case we
+            # don't have a name to show, so fall back to the model name.
+            looks_like_address = device.lower() == str(address).lower()
+            display_name = "MXW01" if looks_like_address else device
     except RuntimeError as e:
-        logger.error(f"🛑 Printer discovery/address error: {e}")
-        return
-    except Exception as e:
-        logger.error(f"🛑 Unexpected error during device scan: {e}")
-        return
+        reporter.error(str(e))
+        raise
 
-    logger.info(f"⏳ Attempting to connect to {address}...")
-
-    notification_state: NotificationState = {
-        "received": {},
-        "condition": asyncio.Condition(),
-    }
+    reporter.step(f"Connecting to {display_name}")
+    notification_state = _new_notification_state()
     receive_notification = notification_receiver_factory(notification_state)
 
+    notify_char_uuid: Optional[str] = None
     try:
         async with BleakClient(address, timeout=20.0) as client:
-            logger.info(f"✅ Connected: {client.is_connected}; MTU: {client.mtu_size}")
+            logger.debug(f"Connected: {client.is_connected}; MTU: {client.mtu_size}")
 
-            control_char = None
-            notify_char = None
-            data_char = None
-            try:
-                service = None
-                possible_service_uuids = [
-                    cmds.MAIN_SERVICE_UUID.lower(),
-                    cmds.MAIN_SERVICE_UUID_ALT.lower(),
-                ]
-                for s in client.services:
-                    if s.uuid.lower() in possible_service_uuids:
-                        service = s
-                        logger.info(f"Found service: {s.uuid}")
-                        break
-                if not service:
-                    raise BleakError(
-                        f"Service {cmds.MAIN_SERVICE_UUID} (or alternative) not found."
-                    )
+            service = None
+            possible_service_uuids = [
+                cmds.MAIN_SERVICE_UUID.lower(),
+                cmds.MAIN_SERVICE_UUID_ALT.lower(),
+            ]
+            for s in client.services:
+                if s.uuid.lower() in possible_service_uuids:
+                    service = s
+                    logger.debug(f"Found service: {s.uuid}")
+                    break
+            if not service:
+                raise BleakError(
+                    f"Service {cmds.MAIN_SERVICE_UUID} (or alternative) not found."
+                )
 
-                control_char = service.get_characteristic(cmds.CONTROL_WRITE_UUID)
-                notify_char = service.get_characteristic(cmds.NOTIFY_UUID)
-                data_char = service.get_characteristic(cmds.DATA_WRITE_UUID)
-                notify_char_uuid = notify_char.uuid
+            control_char = service.get_characteristic(cmds.CONTROL_WRITE_UUID)
+            notify_char = service.get_characteristic(cmds.NOTIFY_UUID)
+            data_char = service.get_characteristic(cmds.DATA_WRITE_UUID)
 
-                if not all([control_char, notify_char, data_char]):
-                    missing = [
-                        uuid
-                        for uuid, char in [
-                            (cmds.CONTROL_WRITE_UUID, control_char),
-                            (cmds.NOTIFY_UUID, notify_char),
-                            (cmds.DATA_WRITE_UUID, data_char),
-                        ]
-                        if char is None
+            if not all([control_char, notify_char, data_char]):
+                missing = [
+                    char_uuid
+                    for char_uuid, char in [
+                        (cmds.CONTROL_WRITE_UUID, control_char),
+                        (cmds.NOTIFY_UUID, notify_char),
+                        (cmds.DATA_WRITE_UUID, data_char),
                     ]
-                    raise BleakError(f"Missing required characteristics: {missing}")
+                    if char is None
+                ]
+                raise BleakError(f"Missing required characteristics: {missing}")
 
-                logger.info("✅ Found required characteristics.")
+            notify_char_uuid = notify_char.uuid
+            logger.debug(f"Starting notifications on {notify_char.uuid}")
+            await client.start_notify(notify_char.uuid, receive_notification)
 
-            except BleakError as e:
-                logger.error(f"🛑 Error finding service/characteristics: {e}")
-                return
-            except Exception as e:
-                logger.error(f"🛑 Unexpected error getting characteristics: {e}")
-                return
+            session = PrinterSession(
+                client=client,
+                control_char=control_char,
+                notify_char=notify_char,
+                data_char=data_char,
+                notify_char_uuid=notify_char.uuid,
+                notification_state=notification_state,
+                reporter=reporter,
+            )
+
+            # The headline result of the discovery+connect dance. When the
+            # user auto-discovered, append a grey `-d <addr>` hint so the
+            # opaque UUID/MAC is recognisable as something they can pass back
+            # in next time. When they explicitly passed -d, skip the hint
+            # (they already know it).
+            hint = f"-d {address}" if autodiscovered else None
+            reporter.done(f"Connected to {display_name}", hint=hint)
 
             try:
-                logger.info(f"Starting notifications on {notify_char.uuid}...")
-                await client.start_notify(notify_char.uuid, receive_notification)
-                logger.info("✅ Notifications started.")
+                yield session
+            finally:
+                if client.is_connected and notify_char_uuid:
+                    try:
+                        logger.debug("Stopping notifications")
+                        await client.stop_notify(notify_char_uuid)
+                    except Exception as e:
+                        logger.debug(f"Error stopping notifications: {e}")
+                logger.debug("Disconnecting")
+    finally:
+        logger.debug("BLE operation finished.")
+
+
+# --- Per-operation helpers ---
+
+
+async def do_status(session: PrinterSession) -> cmds.StatusInfo:
+    payload = await send_and_wait(
+        session,
+        cmds.cmd_get_status(),
+        cmds.CommandIDs.GET_STATUS,
+        NOTIFICATION_TIMEOUT_S,
+    )
+    if payload is None:
+        raise cmds.PrinterError("Timed out waiting for status response (A1)")
+    return cmds.parse_status(payload)
+
+
+async def do_version(session: PrinterSession) -> cmds.VersionInfo:
+    payload = await send_and_wait(
+        session,
+        cmds.cmd_get_version(),
+        cmds.CommandIDs.GET_VERSION,
+        NOTIFICATION_TIMEOUT_S,
+    )
+    if payload is None:
+        raise cmds.PrinterError("Timed out waiting for version response (B1)")
+    return cmds.parse_version(payload)
+
+
+async def do_battery(session: PrinterSession) -> int:
+    payload = await send_and_wait(
+        session,
+        cmds.cmd_get_battery(),
+        cmds.CommandIDs.BATTERY_LEVEL,
+        NOTIFICATION_TIMEOUT_S,
+    )
+    if payload is None:
+        raise cmds.PrinterError("Timed out waiting for battery response (AB)")
+    return cmds.parse_battery(payload)
+
+
+async def do_cancel(session: PrinterSession) -> cmds.StatusInfo:
+    """Send AC cancel-print, then poll A1 to confirm the printer returned to standby."""
+    pre_state: Optional[str] = None
+    try:
+        pre = await do_status(session)
+        pre_state = _format_state(pre)
+    except cmds.PrinterError as e:
+        logger.debug(f"Could not read pre-cancel status: {e}")
+
+    if pre_state:
+        session.reporter.step(f"Cancelling print (was {pre_state})")
+    else:
+        session.reporter.step("Cancelling print")
+
+    await session.client.write_gatt_char(
+        session.control_char.uuid, cmds.cmd_cancel(), response=False
+    )
+    await asyncio.sleep(POST_CANCEL_DELAY_S)
+
+    post = await do_status(session)
+    post_state = _format_state(post)
+    if post.is_standby:
+        session.reporter.done(f"Cancelled (now {post_state})")
+    else:
+        session.reporter.warn(
+            f"Cancel sent but printer is still {post_state}; you may need to power-cycle it."
+        )
+    return post
+
+
+async def do_print(
+    session: PrinterSession, image_data_buffer: bytes, intensity: int
+) -> Optional[float]:
+    """Run the full print sequence: intensity -> status -> A9 -> data -> AD -> AA.
+
+    Aborts before A9 if the printer is not in Standby or is reporting an error,
+    and best-effort sends AC if we exit between A9-ack and AA so the printer
+    isn't left waiting for more data.
+
+    Returns the wall-clock seconds elapsed from the A9 acknowledgment to the
+    AA "print complete" notification (i.e., the end-to-end "actively
+    printing" time, including BLE data transfer). Returns None if the AA
+    notification never arrived or the print aborted before A9.
+    """
+    line_count = len(image_data_buffer) // cmds.PRINTER_WIDTH_BYTES
+    reporter = session.reporter
+
+    reporter.step(f"Setting intensity 0x{intensity:02X}")
+    await session.client.write_gatt_char(
+        session.control_char.uuid, cmds.cmd_set_intensity(intensity), response=False
+    )
+    await asyncio.sleep(0.1)
+
+    reporter.step("Checking printer status")
+    status = await do_status(session)
+    if not status.is_ok:
+        if status.error_code is not None:
+            raise cmds.error_for_code(status.error_code, status.raw)
+        raise cmds.PrinterError(f"Printer reported not OK: {status.raw.hex()}")
+    if status.state != cmds.PrinterStates.STANDBY:
+        raise cmds.PrinterError(
+            f"Printer is not in Standby (state=0x{status.state:02X}); aborting before A9. "
+            "Run `cli.py cancel` or power-cycle the printer and try again."
+        )
+
+    print_in_flight = False
+    try:
+        reporter.step(f"Requesting print of {line_count} lines")
+        print_req_payload = await send_and_wait(
+            session,
+            cmds.cmd_print_request(line_count, cmds.PrintModes.MONOCHROME),
+            cmds.CommandIDs.PRINT,
+            NOTIFICATION_TIMEOUT_S,
+        )
+        if print_req_payload is None:
+            raise cmds.PrinterError(
+                "Timed out waiting for print request acknowledgment (A9)"
+            )
+        if not (len(print_req_payload) > 0 and print_req_payload[0] == 0):
+            raise cmds.PrinterError(
+                f"Printer rejected print request (A9): {print_req_payload.hex()}"
+            )
+        print_in_flight = True
+        # Start the wall-clock the moment the printer ack'd A9. This is the
+        # cleanest "print started" signal we have; everything before it is
+        # setup chatter (intensity/status) that the user doesn't think of as
+        # part of "the print taking N seconds".
+        print_start_t = asyncio.get_event_loop().time()
+        elapsed_s: Optional[float] = None
+
+        # Tell the user roughly how long this is going to take. The estimate
+        # uses the same lines/s constant as the AA timeout, so it stays
+        # in sync if either is retuned. Shown as a permanent grey detail
+        # line so it stays visible while the transient "Sending image..."
+        # progress overwrites itself.
+        estimated_s = line_count / PRINT_COMPLETE_LINES_PER_SEC
+        reporter.detail(f"Estimated ~{estimated_s:.0f}s")
+
+        chunk_size = cmds.PRINTER_WIDTH_BYTES
+        num_chunks = (len(image_data_buffer) + chunk_size - 1) // chunk_size
+        reporter.step(f"Sending image (0/{num_chunks} lines)")
+
+        for i in range(0, len(image_data_buffer), chunk_size):
+            chunk = image_data_buffer[i : i + chunk_size]
+            await session.client.write_gatt_char(
+                session.data_char.uuid, chunk, response=False
+            )
+            await asyncio.sleep(PACING_DELAY_S)
+            current_chunk_num = i // chunk_size + 1
+            # Update reporter every ~5% (or every 16 lines for tiny images).
+            update_every = max(1, num_chunks // 20)
+            if current_chunk_num % update_every == 0 or current_chunk_num == num_chunks:
+                pct = current_chunk_num * 100 // num_chunks
+                reporter.step(
+                    f"Sending image ({current_chunk_num}/{num_chunks} lines, {pct}%)"
+                )
+
+        reporter.step("Flushing buffer")
+        await session.client.write_gatt_char(
+            session.control_char.uuid, cmds.cmd_flush(), response=False
+        )
+        await asyncio.sleep(0.1)
+
+        print_timeout_duration = PRINT_COMPLETE_BASE_TIMEOUT_S + (
+            line_count / PRINT_COMPLETE_LINES_PER_SEC
+        )
+        reporter.step("Waiting for printer to finish")
+        completion_payload = await wait_for(
+            session,
+            cmds.CommandIDs.PRINT_COMPLETE,
+            print_timeout_duration,
+        )
+
+        if completion_payload is None:
+            reporter.warn(
+                f"No print-complete notification within {print_timeout_duration:.0f}s; "
+                "the print may still be running."
+            )
+        else:
+            elapsed_s = asyncio.get_event_loop().time() - print_start_t
+            logger.debug(
+                f"Print Complete payload: {completion_payload.hex()} "
+                f"(elapsed {elapsed_s:.2f}s, {line_count / elapsed_s:.1f} lines/s)"
+            )
+            print_in_flight = False
+            # Headline ✓ line is emitted by the caller (cli.cmd_print) so it
+            # can include the filename. Just leave a transient step so the
+            # disconnect happens under a tidy "Finishing up" hint.
+            reporter.step("Finishing up")
+
+        await asyncio.sleep(1.0)
+        return elapsed_s
+    finally:
+        if print_in_flight:
+            # Replace whichever step was active with a single concise message.
+            reporter.step("Cancelling print")
+            try:
+                await session.client.write_gatt_char(
+                    session.control_char.uuid,
+                    cmds.cmd_cancel(),
+                    response=False,
+                )
+                await asyncio.sleep(POST_CANCEL_DELAY_S)
+                reporter.done("Cancelled")
             except Exception as e:
-                logger.error(f"🛑 Failed to start notifications: {e}")
-                return
+                logger.debug(f"Failed to send cleanup cancel: {e}")
+                reporter.error("Failed to cancel cleanly")
 
-            line_count = len(image_data_buffer) // cmds.PRINTER_WIDTH_BYTES
-            logger.info(
-                f"Prepared {line_count} lines of image data (including padding if any)."
-            )
 
-            logger.info(f"Setting intensity to 0x{intensity:02X}...")
-            intensity_cmd = cmds.cmd_set_intensity(intensity)
-            await client.write_gatt_char(
-                control_char.uuid, intensity_cmd, response=False
-            )
-            await asyncio.sleep(0.1)
+# --- Helpers ---
 
-            logger.info("Requesting printer status (A1)...")
-            status_cmd = cmds.cmd_get_status()
-            await client.write_gatt_char(control_char.uuid, status_cmd, response=False)
-            status_payload = await wait_for_notification(
-                notification_state, cmds.CommandIDs.GET_STATUS, NOTIFICATION_TIMEOUT_S
-            )
-            if status_payload is None:
-                return
 
-            status_ok = False
-            if len(status_payload) >= 13:
-                is_ok_flag = status_payload[12] == 0
-                if is_ok_flag:
-                    status_ok = True
-                    status_byte = status_payload[6]
-                    battery_level = status_payload[9]
-                    logger.info(
-                        f"Printer Status OK (Flag=0). State: 0x{status_byte:02X}, Battery: {battery_level}%"
-                    )
-                else:
-                    error_byte = 0
-                    if len(status_payload) >= 14:
-                        error_byte = status_payload[13]
-                    logger.error(
-                        f"Printer Status Error (Flag!=0). Error code byte: 0x{error_byte:02X}"
-                    )
-            else:
-                logger.error(
-                    f"Received A1 status payload is too short ({len(status_payload)} bytes) to parse fully."
-                )
+_STATE_NAMES = {
+    cmds.PrinterStates.STANDBY: "Standby",
+    cmds.PrinterStates.PRINTING: "Printing",
+}
 
-            logger.info(f"Sending print request for {line_count} lines (A9)...")
-            print_req_cmd = cmds.cmd_print_request(
-                line_count, cmds.PrintModes.MONOCHROME
-            )
-            await client.write_gatt_char(
-                control_char.uuid, print_req_cmd, response=False
-            )
-            print_req_payload = await wait_for_notification(
-                notification_state, cmds.CommandIDs.PRINT, NOTIFICATION_TIMEOUT_S
-            )
-            if print_req_payload is None:
-                return
 
-            if len(print_req_payload) > 0 and print_req_payload[0] == 0:
-                logger.info("✅ Print request accepted (A9 response OK).")
-            else:
-                logger.error(
-                    f"🛑 Printer rejected print request (A9). Payload: {print_req_payload.hex()}. Aborting."
-                )
-                return
+def _format_state(status: cmds.StatusInfo) -> str:
+    if not status.is_ok:
+        if status.error_code is not None:
+            return f"ERROR (code 0x{status.error_code:02X})"
+        return "ERROR (unknown)"
+    if status.state is None:
+        return "Unknown"
+    return _STATE_NAMES.get(status.state, f"Unknown(0x{status.state:02X})")
 
-            logger.info(
-                f"Sending {len(image_data_buffer)} bytes of image data to {data_char.uuid}..."
-            )
-            chunk_size = cmds.PRINTER_WIDTH_BYTES
-            num_chunks = (len(image_data_buffer) + chunk_size - 1) // chunk_size
 
-            for i in range(0, len(image_data_buffer), chunk_size):
-                chunk = image_data_buffer[i : i + chunk_size]
-                await client.write_gatt_char(data_char.uuid, chunk, response=False)
-                await asyncio.sleep(PACING_DELAY_S)
-                current_chunk_num = i // chunk_size + 1
-                if current_chunk_num % 50 == 0 or current_chunk_num == num_chunks:
-                    logger.debug(f"Sent chunk {current_chunk_num}/{num_chunks}")
+# --- Backwards-compatible entry point ---
 
-            logger.info("✅ Finished sending image data.")
 
-            logger.info("Sending data flush command (AD)...")
-            flush_cmd = cmds.cmd_flush()
-            await client.write_gatt_char(control_char.uuid, flush_cmd, response=False)
-            await asyncio.sleep(0.1)
+async def run_ble(image_data_buffer: bytes, device: Optional[str], intensity: int):
+    """Backwards-compatible wrapper used by print.py.
 
-            print_timeout_duration = PRINT_COMPLETE_BASE_TIMEOUT_S + (
-                line_count / PRINT_COMPLETE_LINES_PER_SEC
-            )
-            logger.info(
-                f"Waiting up to {print_timeout_duration:.1f}s for print complete (AA)..."
-            )
-            completion_payload = await wait_for_notification(
-                notification_state,
-                cmds.CommandIDs.PRINT_COMPLETE,
-                print_timeout_duration,
-            )
-
-            if completion_payload is None:
-                logger.warning(
-                    "⚠️ Did not receive print complete notification (AA) within timeout. Print might be finished or still running."
-                )
-            else:
-                logger.info(
-                    f"✅ Print Complete notification (AA) received. Payload: {completion_payload.hex()}"
-                )
-                logger.info(
-                    "🎉 Print job successfully sent and acknowledged by printer."
-                )
-
-            await asyncio.sleep(1.0)
-
+    The new code paths use `connected_printer` + `do_print` directly; this
+    just composes them and swallows expected errors at the top level so the
+    existing `print.py` semantics (no traceback for known errors) are
+    preserved.
+    """
+    try:
+        async with connected_printer(device) as session:
+            await do_print(session, image_data_buffer, intensity)
+    except cmds.PrinterError as e:
+        logger.error(f"🛑 {e}")
     except BleakError as e:
         logger.error(f"🛑 Bluetooth Error: {e}")
     except asyncio.TimeoutError:
-        logger.error(f"🛑 Connection timed out to {address}")
+        logger.error("🛑 Connection timed out")
+    except RuntimeError:
+        # Already logged by connected_printer / get_device_address
+        pass
     except Exception as e:
         logger.error(f"🛑 An unexpected error occurred: {e}", exc_info=True)
-    finally:
-        if client and client.is_connected:
-            if notify_char_uuid:
-                try:
-                    logger.info("Stopping notifications...")
-                    await client.stop_notify(notify_char_uuid)
-                except Exception as e:
-                    logger.error(f"Error stopping notifications: {e}")
-            logger.info("Disconnecting...")
-        else:
-            logger.info("Client was not connected or already disconnected.")
-        logger.info("BLE operation finished.")
