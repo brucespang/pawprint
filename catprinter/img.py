@@ -1,5 +1,9 @@
-import cv2
+import sys
 from math import ceil
+from pathlib import Path
+from typing import Union
+
+import cv2
 import numpy as np
 
 from catprinter import logger
@@ -126,7 +130,28 @@ def read_img(
     img_binarization_algo,
 ) -> np.ndarray:
     im = read_img_grayscale(filename)
+    return _binarize_grayscale(im, print_width, img_binarization_algo)
 
+
+def read_img_from_bytes(
+    data: bytes,
+    print_width: int,
+    img_binarization_algo: str,
+) -> np.ndarray:
+    """Like read_img, but the image bytes are passed in directly.
+
+    Used by the stdin (`-`) path so we can sniff the bytes BEFORE deciding
+    whether they're an image or markdown.
+    """
+    im = read_img_grayscale_from_bytes(data)
+    return _binarize_grayscale(im, print_width, img_binarization_algo)
+
+
+def _binarize_grayscale(
+    im: np.ndarray,
+    print_width: int,
+    img_binarization_algo: str,
+) -> np.ndarray:
     height, width = im.shape
     factor = print_width / width
     resized = cv2.resize(
@@ -166,6 +191,39 @@ def read_img(
     return ~bin_img_bool
 
 
+def dither_png_in_place(
+    path: Union[str, Path],
+    img_binarization_algo: str,
+) -> None:
+    """Dither a PNG file in place at its existing width.
+
+    Reads the file as grayscale, applies `img_binarization_algo` (any of the
+    algos accepted by `read_img`), and writes the binarized result back to
+    the same path as a 1-bit-looking 8-bit PNG (0 for black, 255 for white).
+
+    No-op when `img_binarization_algo == "none"`: the file is left untouched.
+    Use case: the markdown -> PNG render pipeline calls this after the
+    Playwright screenshot so the PNG you preview is what the printer will
+    actually print, and the print path can then read it back with `none`
+    binarization (avoiding a double-dither at slightly different scales).
+    """
+    if img_binarization_algo == "none":
+        return
+    path = Path(path)
+    im = read_img_grayscale(str(path))
+    width = im.shape[1]
+    # _binarize_grayscale resizes to `print_width`; passing the image's own
+    # width makes that a no-op (other than halftone, which intentionally
+    # rescales by its block size). We want the output PNG to stay at the
+    # render width so the print path can re-read it as-is.
+    bin_img_bool = _binarize_grayscale(im, width, img_binarization_algo)
+    # bin_img_bool: True where the printer should fire (i.e. black).
+    out_uint8 = (~bin_img_bool).astype(np.uint8) * 255
+    ok = cv2.imwrite(str(path), out_uint8)
+    if not ok:
+        raise RuntimeError(f"Failed to write dithered PNG to {path}")
+
+
 def read_img_grayscale(
     filename,
     bg_color=[255, 255, 255],
@@ -173,28 +231,47 @@ def read_img_grayscale(
     """
     Reads an image from filename and converts it to grayscale.
     If the image has an alpha channel, it is blended with bg_color.
+
+    Pass "-" to read raw image bytes from stdin (any format OpenCV can
+    decode: PNG/JPG/BMP/...). Useful for piping, e.g.
+    `convert foo.heic png:- | pawprint print -`.
     """
+    if filename == "-":
+        data = sys.stdin.buffer.read()
+        return read_img_grayscale_from_bytes(data, bg_color=bg_color)
     im = cv2.imread(filename, cv2.IMREAD_UNCHANGED)
     if im is None:
         raise RuntimeError(f"Could not read image file: {filename}")
+    return _to_grayscale(im, bg_color)
 
-    # If image has alpha channel
+
+def read_img_grayscale_from_bytes(
+    data: bytes,
+    bg_color=[255, 255, 255],
+) -> np.ndarray:
+    """Decode raw image bytes (any format cv2 supports) to grayscale."""
+    if not data:
+        raise RuntimeError("No image data.")
+    arr = np.frombuffer(data, dtype=np.uint8)
+    im = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+    if im is None:
+        raise RuntimeError(
+            "Could not decode image bytes "
+            "(unsupported format or truncated input)."
+        )
+    return _to_grayscale(im, bg_color)
+
+
+def _to_grayscale(im: np.ndarray, bg_color) -> np.ndarray:
     if im.ndim == 3 and im.shape[2] == 4:
         rgb = im[..., :3].astype(np.float32)
         alpha = im[..., 3].astype(np.float32) / 255.0
         bg = np.array(bg_color, dtype=np.float32)
-        # Blend each pixel with bg_color according to alpha
         blended = rgb * alpha[..., None] + bg * (1 - alpha[..., None])
-        # Convert to grayscale
-        im_gray = cv2.cvtColor(blended.astype(np.uint8), cv2.COLOR_RGB2GRAY)
-    else:
-        # Already grayscale or no alpha
-        if im.ndim == 2:
-            im_gray = im
-        else:
-            im_gray = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
-
-    return im_gray
+        return cv2.cvtColor(blended.astype(np.uint8), cv2.COLOR_RGB2GRAY)
+    if im.ndim == 2:
+        return im
+    return cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
 
 
 def show_preview(preview_img_uint8: np.ndarray):

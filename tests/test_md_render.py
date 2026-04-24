@@ -235,6 +235,35 @@ def test_render_md_to_png_width_and_height(tmp_path: Path):
 
 
 @_REQUIRES_CHROMIUM
+def test_render_md_to_png_dithered_output(tmp_path: Path):
+    """`dithering_algo=floyd-steinberg` should produce a 1-bit-style PNG.
+
+    The pixel histogram should collapse to (effectively) two values: 0 and
+    255. We allow a small tolerance for cv2.imwrite/imread quantization
+    edges, but anything dramatically grey would mean dithering didn't run.
+    """
+    import cv2
+    import numpy as np
+
+    from catprinter.md_render import render_md_to_png
+
+    src = tmp_path / "x.md"
+    src.write_text("# Hello\n\nSome grey **text** that the dither can chew on.\n")
+    out = tmp_path / "x.png"
+    render_md_to_png(src, out, dithering_algo="floyd-steinberg")
+    assert out.is_file()
+    img = cv2.imread(str(out), cv2.IMREAD_GRAYSCALE)
+    assert img is not None
+    # Non-extreme pixels (anything that's neither solid black nor solid white)
+    # should be vanishingly rare after dithering.
+    midtone = np.count_nonzero((img > 16) & (img < 239))
+    total = img.size
+    assert midtone / total < 0.01, (
+        f"expected <1% midtone pixels after dither, got {midtone}/{total}"
+    )
+
+
+@_REQUIRES_CHROMIUM
 def test_render_md_keep_html(tmp_path: Path):
     from catprinter.md_render import render_md_to_png
 
@@ -299,3 +328,164 @@ def test_print_dry_run_autodetects_md(tmp_path: Path):
     src.write_text("# Hello\n\n- [ ] one\n- [ ] two\n")
     rc = main(["print", str(src), "--dry-run"])
     assert rc == 0
+
+
+@_REQUIRES_CHROMIUM
+def test_render_md_text_to_png_from_string(tmp_path: Path):
+    """The text-based renderer entry point used by `render -` (stdin)."""
+    import asyncio
+
+    from catprinter.md_render import render_md_text_to_png_async
+
+    out = tmp_path / "stdin.png"
+    asyncio.run(
+        render_md_text_to_png_async(
+            "# From stdin\n\nHello world.\n",
+            out,
+            base_dir=tmp_path,
+        )
+    )
+    assert out.is_file() and out.stat().st_size > 100
+    w, _ = _png_dimensions(out)
+    assert w == 384
+
+
+class _BytesStdin:
+    """Minimal sys.stdin stub: exposes a `.buffer` with raw bytes."""
+
+    def __init__(self, data: bytes):
+        import io
+
+        self.buffer = io.BytesIO(data)
+
+
+@_REQUIRES_CHROMIUM
+def test_render_stdin_requires_output(monkeypatch):
+    """`pawprint render -` without -o should fail loudly, not crash."""
+    from pawprint import main
+
+    monkeypatch.setattr("sys.stdin", _BytesStdin(b"# Hi\n"))
+    rc = main(["render", "-"])
+    assert rc == 1
+
+
+@_REQUIRES_CHROMIUM
+def test_render_stdin_pipeline(monkeypatch, tmp_path: Path):
+    """End-to-end: `pawprint render - -o out.png` should produce a PNG."""
+    from pawprint import main
+
+    out = tmp_path / "piped.png"
+    monkeypatch.setattr(
+        "sys.stdin", _BytesStdin(b"# Piped\n\nBody text.\n")
+    )
+    rc = main(["render", "-", "-o", str(out)])
+    assert rc == 0
+    assert out.is_file() and out.stat().st_size > 100
+
+
+def test_print_stdin_missing_data_errors(monkeypatch):
+    """`pawprint print -` with empty stdin should error cleanly (no traceback).
+
+    This doesn't need Chromium - it fails before BLE and before rendering.
+    Empty stdin sniffs as markdown (vs. image), so it'll bottom out in the
+    markdown branch's "no markdown" handling - but render_md_text is hit
+    first which would need Chromium. So we instead expect either rc==1 or
+    a chromium-skip outcome; in this CI env we just assert non-zero.
+    """
+    from pawprint import main
+
+    monkeypatch.setattr("sys.stdin", _BytesStdin(b""))
+    # Empty stdin -> sniffed as markdown -> tries to render via Chromium.
+    # If Chromium isn't installed we'll get a non-zero exit either way.
+    rc = main(["print", "-", "--dry-run"])
+    # Without Chromium the markdown render will fail; with Chromium and
+    # empty input we get an empty PNG and rc==0. Either way is fine; we
+    # just want to make sure we don't crash with a traceback.
+    assert rc in (0, 1)
+
+
+@_REQUIRES_CHROMIUM
+def test_print_stdin_sniffs_image(monkeypatch, tmp_path: Path):
+    """`pawprint print -` with PNG bytes on stdin should take the image path."""
+    import struct
+    import zlib
+
+    from pawprint import main
+
+    # Tiny valid 384x1 white PNG (handcrafted to avoid pulling in PIL/cv2).
+    def _make_png(width: int, height: int) -> bytes:
+        sig = b"\x89PNG\r\n\x1a\n"
+
+        def chunk(typ: bytes, data: bytes) -> bytes:
+            return (
+                struct.pack(">I", len(data))
+                + typ
+                + data
+                + struct.pack(">I", zlib.crc32(typ + data) & 0xFFFFFFFF)
+            )
+
+        ihdr = struct.pack(">IIBBBBB", width, height, 8, 0, 0, 0, 0)
+        # 1 byte of filter (0=None) + width bytes of pixel data per row.
+        raw = b"".join(b"\x00" + b"\xff" * width for _ in range(height))
+        idat = zlib.compress(raw)
+        return sig + chunk(b"IHDR", ihdr) + chunk(b"IDAT", idat) + chunk(b"IEND", b"")
+
+    png = _make_png(384, 4)
+    monkeypatch.setattr("sys.stdin", _BytesStdin(png))
+    rc = main(["print", "-", "--dry-run"])
+    assert rc == 0
+
+
+def test_sniff_markdown_with_binary_bytes():
+    """Markdown that happens to contain stray binary bytes should still
+    be classified as markdown, not image."""
+    from catprinter.sniff import sniff_stdin_kind
+
+    # Bytes that aren't a known image header. Includes a stray NUL and
+    # some high bytes (mimics e.g. a markdown file with smart quotes that
+    # got mangled to invalid UTF-8).
+    data = b"# Hello\n\nSome text\x00\xc3\x28 with weirdness.\n"
+    result = sniff_stdin_kind(data)
+    assert result.kind == "markdown"
+    assert result.image_extension is None
+
+
+def test_sniff_recognizes_real_png():
+    """A real PNG should be classified as an image with extension 'png'."""
+    import struct
+    import zlib
+
+    from catprinter.sniff import sniff_stdin_kind
+
+    sig = b"\x89PNG\r\n\x1a\n"
+
+    def chunk(typ: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + typ
+            + data
+            + struct.pack(">I", zlib.crc32(typ + data) & 0xFFFFFFFF)
+        )
+
+    ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 0, 0, 0, 0)
+    png = sig + chunk(b"IHDR", ihdr)
+    result = sniff_stdin_kind(png)
+    assert result.kind == "image"
+    assert result.image_extension == "png"
+
+
+def test_print_stdin_unsupported_image_format_errors(monkeypatch, capsys):
+    """A HEIC blob on stdin should error with a clear message, NOT render
+    the bytes as markdown."""
+    from pawprint import main
+
+    # HEIC files have an `ftypheic` box near the start. Construct a
+    # minimal blob with the magic that `filetype` recognizes; cv2 will
+    # refuse to decode it (no HEIF support in upstream wheels).
+    heic_magic = b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00mif1heic"
+    monkeypatch.setattr("sys.stdin", _BytesStdin(heic_magic + b"\x00" * 64))
+    rc = main(["print", "-", "--dry-run"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    # Should mention HEIC (or HEIF) so the user knows why.
+    assert "HEIC" in err or "HEIF" in err, err

@@ -54,6 +54,12 @@ $ uv run pawprint print demo/todo.md
 # Render markdown to a PNG without printing (great for previewing styling):
 $ uv run pawprint render demo/todo.md -o /tmp/todo.png
 
+# Pipe via stdin with `-`. Content type is auto-detected from magic bytes,
+# so `print -` accepts EITHER an image stream (PNG/JPG/...) or markdown:
+$ convert photo.heic png:- | uv run pawprint print -
+$ echo "# Hi from stdin" | uv run pawprint print -
+$ echo "# Hi" | uv run pawprint render - -o /tmp/note.png
+
 # If you know the address, you can skip the search.
 $ uv run pawprint status -d <ADDR>
 
@@ -72,7 +78,9 @@ usage: pawprint print [-h] [-l {debug,info,warn,warning,error}] [-d DEVICE]
 ```
 
 - `-b/--dithering-algo`: image binarization algorithm. Use `none` if your
-  image is already 384px wide and 1-bit.
+  image is already 384px wide and 1-bit. For `.md` inputs this controls
+  the dither applied to the rendered PNG; the printed strip is then sent
+  as-is, no second dither.
 - `-s/--show-preview`: opens an OpenCV preview window and asks for
   confirmation before sending the image to the printer.
 - `-i/--intensity`: print darkness, `0x00`-`0xFF`. Default `0x5D`.
@@ -123,6 +131,20 @@ h1, h2 { text-align: center; }
 There's no TOML config and no per-property CLI flags - if you want to change
 something, write CSS. `--keep-html` dumps the post-template HTML next to the
 PNG so you can iterate quickly with a real browser's devtools.
+
+By default `pawprint render` writes a **dithered** PNG (Floyd-Steinberg) so
+the file you preview matches what the printer's heating elements will
+actually fire. Pick a different algorithm with `-b/--dithering-algo`, or
+pass `-b none` to keep the raw anti-aliased Chromium screenshot:
+
+```bash
+$ uv run pawprint render demo/todo.md -b atkinson
+$ uv run pawprint render demo/todo.md -b none -o /tmp/raw.png
+```
+
+The `print` command applies the same dither during rendering and then
+sends the rendered PNG as-is (no second dither at a slightly different
+scale), so what you see in `render` output is what gets printed.
 
 ### Markdown demo
 

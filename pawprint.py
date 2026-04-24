@@ -31,11 +31,13 @@ from catprinter.ble import (
     do_status,
     do_version,
 )
-from catprinter.img import read_img, show_preview
+from catprinter.img import read_img, read_img_from_bytes, show_preview
 from catprinter.md_render import (
     DEFAULT_WIDTH_PX,
+    render_md_text_to_png_async,
     render_md_to_png_async,
 )
+from catprinter.sniff import sniff_stdin_kind
 from catprinter.ui import Reporter, countdown_step
 
 
@@ -89,7 +91,9 @@ def _add_print_args(parser: argparse.ArgumentParser) -> None:
             "Image file to print (PNG/JPG/...). If the path ends in .md the "
             "file is rendered to a temporary PNG via the same pipeline as "
             "`render` and then printed; the temp PNG path is logged so you "
-            "can inspect what was actually sent."
+            "can inspect what was actually sent. Pass `-` to read from "
+            "stdin: image bytes (PNG/JPG/...) and markdown text are both "
+            "accepted; the type is auto-detected from magic bytes."
         ),
     )
     parser.add_argument(
@@ -178,7 +182,14 @@ def _add_print_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_render_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("filename", type=str, help="Markdown file to render.")
+    parser.add_argument(
+        "filename",
+        type=str,
+        help=(
+            "Markdown file to render. Pass `-` to read markdown from stdin "
+            "(in which case `-o` is required)."
+        ),
+    )
     parser.add_argument(
         "-o",
         "--output",
@@ -187,6 +198,19 @@ def _add_render_args(parser: argparse.ArgumentParser) -> None:
         help=(
             "Output PNG path. Defaults to the input filename with a .png "
             "extension, written next to the source markdown."
+        ),
+    )
+    parser.add_argument(
+        "-b",
+        "--dithering-algo",
+        type=str,
+        choices=["mean-threshold", "floyd-steinberg", "atkinson", "halftone", "none"],
+        default="floyd-steinberg",
+        help=(
+            "Dither the rendered PNG so the saved file matches what the "
+            "printer will actually fire (1-bit). Pass `none` to keep the "
+            "raw anti-aliased Chromium screenshot instead. Default: "
+            "floyd-steinberg, which also matches `print`'s default."
         ),
     )
     parser.add_argument(
@@ -466,11 +490,26 @@ async def cmd_print(args: argparse.Namespace, reporter: Reporter) -> int:
     from pathlib import Path
 
     filename = args.filename
-    if not os.path.exists(filename):
+    is_stdin = filename == "-"
+    if not is_stdin and not os.path.exists(filename):
         reporter.error(f"File not found: {filename}")
         return 1
 
-    if _is_markdown_path(filename):
+    # `-` reads bytes from stdin and content-sniffs to decide image vs.
+    # markdown. See catprinter.sniff for the rationale; the short version
+    # is "magic-byte image detection beats trying to detect markdown",
+    # because real markdown files routinely contain stray binary bytes
+    # while real image files always have a recognizable header.
+    if is_stdin:
+        stdin_data = sys.stdin.buffer.read()
+        sniff = sniff_stdin_kind(stdin_data)
+        is_markdown_input = sniff.kind == "markdown"
+    else:
+        stdin_data = b""
+        sniff = None
+        is_markdown_input = _is_markdown_path(filename)
+
+    if is_markdown_input:
         # Render to a non-deleted temp PNG so the user can inspect what was
         # actually sent to the printer if anything looks off.
         tmp = tempfile.NamedTemporaryFile(
@@ -478,24 +517,69 @@ async def cmd_print(args: argparse.Namespace, reporter: Reporter) -> int:
         )
         tmp.close()
         png_path = Path(tmp.name)
-        reporter.step(f"Rendering {filename}")
-        await render_md_to_png_async(
-            Path(filename),
-            png_path,
-            extra_css_paths=[Path(p) for p in args.style],
-            keep_html=args.keep_html,
-        )
-        reporter.done(f"Rendered {filename} -> {png_path}")
+        if is_stdin:
+            reporter.step("Rendering markdown from stdin")
+            # errors="replace" so stray binary bytes (BOMs, smart quotes
+            # gone wrong, etc.) don't crash the renderer - they'll show as
+            # U+FFFD on the page, which is a much better debug signal than
+            # a UnicodeDecodeError traceback.
+            md_text = stdin_data.decode("utf-8", errors="replace")
+            await render_md_text_to_png_async(
+                md_text,
+                png_path,
+                base_dir=Path.cwd(),
+                extra_css_paths=[Path(p) for p in args.style],
+                keep_html=args.keep_html,
+                dithering_algo=args.dithering_algo,
+            )
+            reporter.done(f"Rendered <stdin> -> {png_path}")
+        else:
+            reporter.step(f"Rendering {filename}")
+            await render_md_to_png_async(
+                Path(filename),
+                png_path,
+                extra_css_paths=[Path(p) for p in args.style],
+                keep_html=args.keep_html,
+                dithering_algo=args.dithering_algo,
+            )
+            reporter.done(f"Rendered {filename} -> {png_path}")
         image_path = str(png_path)
+        # The temp PNG is now the input; clear stdin_data so we go through
+        # the file path below rather than re-decoding the markdown bytes.
+        stdin_data = b""
+        # The render step already dithered to 1-bit at the printer width, so
+        # short-circuit the read step to a plain threshold (no second
+        # dither, no second resize). The image is guaranteed to be exactly
+        # PRINTER_WIDTH_PIXELS wide here.
+        read_algo = "none"
     else:
         image_path = filename
+        read_algo = args.dithering_algo
 
-    reporter.step(f"Reading {image_path}")
-    bin_img_bool = read_img(
-        image_path,
-        cmds.PRINTER_WIDTH_PIXELS,
-        args.dithering_algo,
-    )
+    display_path = "<stdin>" if is_stdin else image_path
+    reporter.step(f"Reading {display_path}")
+    if is_stdin and not is_markdown_input:
+        try:
+            bin_img_bool = read_img_from_bytes(
+                stdin_data, cmds.PRINTER_WIDTH_PIXELS, read_algo
+            )
+        except RuntimeError as e:
+            ext = sniff.image_extension if sniff else None
+            if ext:
+                reporter.error(
+                    f"Detected {ext.upper()} on stdin but couldn't decode "
+                    f"it (OpenCV doesn't support every image format). "
+                    f"Try converting to PNG first: "
+                    f"`magick input.{ext} png:- | pawprint print -`."
+                )
+                return 1
+            raise e
+    else:
+        bin_img_bool = read_img(
+            image_path,
+            cmds.PRINTER_WIDTH_PIXELS,
+            read_algo,
+        )
 
     if args.show_preview:
         preview_img_uint8 = (~bin_img_bool).astype(np.uint8) * 255
@@ -513,7 +597,7 @@ async def cmd_print(args: argparse.Namespace, reporter: Reporter) -> int:
     if args.dry_run:
         reporter.warn(
             f"Dry run: skipping BLE. Would print {line_count} lines "
-            f"({len(image_data_buffer)} bytes) from {image_path}."
+            f"({len(image_data_buffer)} bytes) from {display_path}."
         )
         return 0
 
@@ -521,17 +605,51 @@ async def cmd_print(args: argparse.Namespace, reporter: Reporter) -> int:
         elapsed_s = await do_print(session, image_data_buffer, args.intensity)
     if elapsed_s is not None:
         reporter.done(
-            f"Printed {filename} ({line_count} lines, {elapsed_s:.1f}s)"
+            f"Printed {display_path} ({line_count} lines, {elapsed_s:.1f}s)"
         )
     else:
         # AA never arrived (warning was already emitted by do_print); skip
         # the timing rather than print a misleading "0.0s".
-        reporter.done(f"Printed {filename} ({line_count} lines)")
+        reporter.done(f"Printed {display_path} ({line_count} lines)")
     return 0
 
 
 async def cmd_render(args: argparse.Namespace, reporter: Reporter) -> int:
     from pathlib import Path
+
+    if args.filename == "-":
+        if not args.output:
+            reporter.error(
+                "When reading markdown from stdin (`-`), `-o/--output` is "
+                "required (no source path to default the output from)."
+            )
+            return 1
+        stdin_data = sys.stdin.buffer.read()
+        sniff = sniff_stdin_kind(stdin_data)
+        if sniff.kind == "image":
+            ext = sniff.image_extension or "image"
+            reporter.error(
+                f"`render` only handles markdown, but stdin looks like a "
+                f"{ext.upper()} image. Did you mean `pawprint print -`?"
+            )
+            return 1
+        md_text = stdin_data.decode("utf-8", errors="replace")
+        if not md_text.strip():
+            reporter.error("No markdown on stdin.")
+            return 1
+        out_path = Path(args.output)
+        reporter.step(f"Rendering <stdin> -> {out_path}")
+        await render_md_text_to_png_async(
+            md_text,
+            out_path,
+            base_dir=Path.cwd(),
+            extra_css_paths=[Path(p) for p in args.style],
+            width_px=args.width,
+            keep_html=args.keep_html,
+            dithering_algo=args.dithering_algo,
+        )
+        reporter.done(f"Wrote {out_path}")
+        return 0
 
     md_path = Path(args.filename)
     if not md_path.is_file():
@@ -546,6 +664,7 @@ async def cmd_render(args: argparse.Namespace, reporter: Reporter) -> int:
         extra_css_paths=[Path(p) for p in args.style],
         width_px=args.width,
         keep_html=args.keep_html,
+        dithering_algo=args.dithering_algo,
     )
     reporter.done(f"Wrote {out_path}")
     return 0

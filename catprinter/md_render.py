@@ -335,38 +335,48 @@ async def _screenshot_with(
                 pass
 
 
-def _md_to_page_html(
-    md_path: Path,
+def _md_text_to_page_html(
+    text: str,
+    *,
+    base_dir: Path,
     extra_css_paths: Sequence[Path],
+    title: str,
 ) -> str:
-    text = md_path.read_text(encoding="utf-8")
-    body_html = md_to_html(text, base_dir=md_path.parent.resolve())
+    body_html = md_to_html(text, base_dir=Path(base_dir).resolve())
     return build_page(
-        body_html, extra_css_paths=extra_css_paths, title=md_path.stem
+        body_html, extra_css_paths=extra_css_paths, title=title
     )
 
 
-async def render_md_to_png_async(
-    md_path: Path,
+async def render_md_text_to_png_async(
+    md_text: str,
     out_path: Path,
     *,
+    base_dir: Path,
+    title: str = "catprinter",
     extra_css_paths: Sequence[Path] = (),
     width_px: int = DEFAULT_WIDTH_PX,
     keep_html: bool = False,
+    dithering_algo: str = "none",
     browser: Optional["Browser"] = None,
 ) -> Path:
-    """Async one-shot: read a .md file, render it to a PNG.
+    """Async one-shot: render markdown text directly to a PNG.
 
-    Use this when you're already inside an event loop (e.g. from another
-    async CLI command). Pass `browser` to reuse a long-lived Chromium.
+    `base_dir` anchors relative image references in the markdown. Use this
+    variant when the source isn't on disk (e.g. piped in via stdin).
+
+    `dithering_algo` (default `"none"`) post-processes the screenshot in
+    place via `catprinter.img.dither_png_in_place`, so the saved PNG is the
+    1-bit image the printer will actually fire. Pass `"none"` to keep the
+    raw anti-aliased Chromium screenshot.
     """
-    md_path = Path(md_path)
     out_path = Path(out_path)
-    page_html = _md_to_page_html(md_path, extra_css_paths)
-    # When the user asked to keep the HTML, write it directly to its final
-    # location and let render_html_to_png navigate to it (rather than write
-    # a separate temp file). Otherwise let render_html_to_png manage a
-    # temporary file beside the PNG output.
+    page_html = _md_text_to_page_html(
+        md_text,
+        base_dir=base_dir,
+        extra_css_paths=extra_css_paths,
+        title=title,
+    )
     html_path = out_path.with_suffix(".html") if keep_html else None
     if html_path is not None:
         logger.debug(f"Will keep intermediate HTML at {html_path}")
@@ -377,7 +387,44 @@ async def render_md_to_png_async(
         browser=browser,
         html_path=html_path,
     )
+    if dithering_algo != "none":
+        # Imported lazily so md_render -> img is only pulled in when actually
+        # needed (keeps the import graph thin for the pure HTML codepaths).
+        from catprinter.img import dither_png_in_place
+
+        dither_png_in_place(out_path, dithering_algo)
     return out_path
+
+
+async def render_md_to_png_async(
+    md_path: Path,
+    out_path: Path,
+    *,
+    extra_css_paths: Sequence[Path] = (),
+    width_px: int = DEFAULT_WIDTH_PX,
+    keep_html: bool = False,
+    dithering_algo: str = "none",
+    browser: Optional["Browser"] = None,
+) -> Path:
+    """Async one-shot: read a .md file, render it to a PNG.
+
+    Use this when you're already inside an event loop (e.g. from another
+    async CLI command). Pass `browser` to reuse a long-lived Chromium.
+
+    See `render_md_text_to_png_async` for `dithering_algo`.
+    """
+    md_path = Path(md_path)
+    return await render_md_text_to_png_async(
+        md_path.read_text(encoding="utf-8"),
+        out_path,
+        base_dir=md_path.parent,
+        title=md_path.stem,
+        extra_css_paths=extra_css_paths,
+        width_px=width_px,
+        keep_html=keep_html,
+        dithering_algo=dithering_algo,
+        browser=browser,
+    )
 
 
 def render_md_to_png(
@@ -387,6 +434,7 @@ def render_md_to_png(
     extra_css_paths: Sequence[Path] = (),
     width_px: int = DEFAULT_WIDTH_PX,
     keep_html: bool = False,
+    dithering_algo: str = "none",
 ) -> Path:
     """Synchronous one-shot. Wraps `render_md_to_png_async` with asyncio.run.
 
@@ -399,5 +447,6 @@ def render_md_to_png(
             extra_css_paths=extra_css_paths,
             width_px=width_px,
             keep_html=keep_html,
+            dithering_algo=dithering_algo,
         )
     )
